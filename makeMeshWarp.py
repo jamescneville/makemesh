@@ -9,6 +9,7 @@ from pathlib import Path
 import open3d as o3d
 from tabulate import tabulate
 import h5py
+import cupy as cp  # Added for GPU-accelerated array operations
 
 # Import and initialize NVIDIA Warp for GPU acceleration
 import warp as wp
@@ -70,13 +71,16 @@ def process_voxel_kernel(n: int,
     for j in range(8):
         connectivity[i * 8 + j] = point_id_offset + i * 8 + j
 
-# Process a mesh level on the GPU, generating corners and connectivity
+# Process a mesh level on the GPU, returning Warp arrays
 def process_level_gpu(args):
     data, v, origin, level, point_id_offset = args
-    true_indices = np.argwhere(data)
+    true_indices = np.argwhere(data)  # Still computed on CPU due to np.argwhere
     num_voxels = len(true_indices)
     if num_voxels == 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 8), dtype=np.int32), level
+        # Return empty Warp arrays instead of NumPy
+        corners_wp = wp.zeros((0, 3), dtype=wp.vec3f, device=DEVICE)
+        connectivity_wp = wp.zeros((0, 8), dtype=wp.int32, device=DEVICE)
+        return corners_wp, connectivity_wp, level
 
     corners_flat = wp.zeros(num_voxels * 8 * 3, dtype=wp.float32, device=DEVICE)
     connectivity_flat = wp.zeros(num_voxels * 8, dtype=wp.int32, device=DEVICE)
@@ -94,9 +98,10 @@ def process_level_gpu(args):
     )
     wp.synchronize()
 
-    corners_np = corners_flat.numpy().reshape(-1, 3)
-    connectivity_np = connectivity_flat.numpy().reshape(-1, 8)
-    return corners_np, connectivity_np, level
+    # Reshape on GPU without converting to NumPy
+    corners_wp = corners_flat.reshape((num_voxels * 8, 3))
+    connectivity_wp = connectivity_flat.reshape((num_voxels, 8))
+    return corners_wp, connectivity_wp, level
 
 # Warp kernels for voxel operations: grow, fill, remove, and crop
 
@@ -470,96 +475,6 @@ def compute_indices(
         z = wp.int64(gc[2])
         indices[i] = x + span[0] * (y + span[1] * z)
 
-# Identify unique indices in a sorted array
-@wp.kernel
-def compute_mask(
-    sorted_indices: wp.array(dtype=wp.int64),
-    mask: wp.array(dtype=wp.uint8)
-):
-    i = wp.tid()
-    if i < sorted_indices.shape[0]:
-        if i == 0:
-            mask[i] = wp.uint8(1)
-        elif sorted_indices[i] != sorted_indices[i - 1]:
-            mask[i] = wp.uint8(1)
-        else:
-            mask[i] = wp.uint8(0)
-
-# Set indices of first occurrences of unique points
-@wp.kernel
-def set_first_occurrence(
-    mask: wp.array(dtype=wp.uint8),
-    prefix_sum: wp.array(dtype=wp.int32),
-    sorted_order: wp.array(dtype=wp.int32),
-    first_occurrence_indices: wp.array(dtype=wp.int32)
-):
-    i = wp.tid()
-    if i < mask.shape[0] and mask[i] == 1:
-        idx = wp.int32(0)  # Default value
-        if i > 0:
-            idx = prefix_sum[i] - 1
-        else:
-            idx = 0
-        first_occurrence_indices[idx] = sorted_order[i]
-
-# Map original indices to unique indices
-@wp.kernel
-def compute_mapping(
-    indices: wp.array(dtype=wp.int64),
-    unique_grid_indices: wp.array(dtype=wp.int64),
-    mapping: wp.array(dtype=wp.int32)
-):
-    i = wp.tid()
-    if i < indices.shape[0]:
-        j = wp.lower_bound(unique_grid_indices, indices[i])
-        if j < unique_grid_indices.shape[0] and unique_grid_indices[j] == indices[i]:
-            mapping[i] = j
-        else:
-            mapping[i] = -1  # Should not occur
-
-# Remap connectivity using the mapping array
-@wp.kernel
-def remap_connectivity(
-    connectivity: wp.array(dtype=wp.int32, ndim=2),
-    mapping: wp.array(dtype=wp.int32),
-    new_connectivity: wp.array(dtype=wp.int32, ndim=2)
-):
-    i = wp.tid()
-    if i < connectivity.shape[0]:
-        for j in range(8):
-            new_connectivity[i, j] = mapping[connectivity[i, j]]
-
-# Extract a component from a vector array
-@wp.kernel
-def extract_component(
-    vec_array: wp.array(dtype=wp.vec3i),
-    component_idx: wp.int32,
-    output: wp.array(dtype=wp.int32)
-):
-    i = wp.tid()
-    if i < vec_array.shape[0]:
-        output[i] = vec_array[i][component_idx]
-
-# Compute minimum value in an array using atomic operations
-@wp.kernel
-def compute_min(
-    data: wp.array(dtype=wp.int32),
-    result: wp.array(dtype=wp.int32)
-):
-    i = wp.tid()
-    if i < data.shape[0]:
-        wp.atomic_min(result, 0, data[i])
-
-# Compute maximum value in an array using atomic operations
-@wp.kernel
-def compute_max(
-    data: wp.array(dtype=wp.int32),
-    result: wp.array(dtype=wp.int32)
-):
-    i = wp.tid()
-    if i < data.shape[0]:
-        wp.atomic_max(result, 0, data[i])
-
 # Define a constant cross-shaped kernel for morphological operations
 crosskernel = np.ones((3, 3, 3), bool)
 crosskernel[0, 0, 0] = False
@@ -576,7 +491,7 @@ def roundCloseFloor(a, intTol):
     a[inds] = np.round(a[inds])
     return np.floor(a)
 
-# Save mesh data to a VTK unstructured grid file
+# Save mesh data to a VTK unstructured grid file with optimized merging
 def save_to_unstructured_vtk(levels_data, filename, voxSize):
     print("/// Creating combined Unstructured Grid VTK file...")
     tic = time.perf_counter()
@@ -585,109 +500,109 @@ def save_to_unstructured_vtk(levels_data, filename, voxSize):
     num_voxels_per_level = [np.sum(data) for data, _, _, _ in levels_data]
     num_points_per_level = [8 * num_voxels for num_voxels in num_voxels_per_level]
     point_id_offsets = np.cumsum([0] + num_points_per_level[:-1])
-    all_corners = []
-    all_cell_connectivity = []
+    all_corners_wp = []
+    all_connectivity_wp = []
     all_levels = []
     total_cells = 0
     for level_idx, ((data, v, origin, level), offset) in enumerate(zip([item[:4] for item in levels_data], point_id_offsets)):
-        corners, cell_connectivity, lev = process_level_gpu((data, v, origin, level, offset))
+        corners_wp, connectivity_wp, lev = process_level_gpu((data, v, origin, level, offset))
         if num_voxels_per_level[level_idx] > 0:
             print(f"    Processing level {lev}: Voxel size {v}, Shape {data.shape}")
         else:
             print(f"    Skipping level {lev} (no unique data)")
-        all_corners.append(corners)
-        all_cell_connectivity.append(cell_connectivity)
-        all_levels.extend([lev] * cell_connectivity.shape[0])
-        total_cells += cell_connectivity.shape[0]
+        all_corners_wp.append(corners_wp)
+        all_connectivity_wp.append(connectivity_wp)
+        all_levels.extend([lev] * connectivity_wp.shape[0])
+        total_cells += connectivity_wp.shape[0]
     print("    Processing levels complete")
+
+    # Stack coordinates and connectivity on GPU using CuPy
     print("    Stacking coordinates and connectivity")
-    all_coords = np.vstack(all_corners)
-    point_ids = np.vstack(all_cell_connectivity)
-    
+    all_coords_cp = cp.concatenate([cp.asarray(c) for c in all_corners_wp], axis=0)
+    all_connectivity_cp = cp.concatenate([cp.asarray(c) for c in all_connectivity_wp], axis=0)
+
+    # Optimized merging of duplicate points on GPU
     print("    Merging duplicate points")
-    ticcounter = time.perf_counter()
-    
-    all_corners_wp = wp.array(all_coords, dtype=wp.vec3f, device="cuda")
-    all_connectivity_wp = wp.array(point_ids, dtype=wp.int32, device="cuda")
+    tic_counter = time.perf_counter()
+
+    # Create Warp arrays from CuPy arrays using pointers
+    ptr_coords = all_coords_cp.data.ptr  # Get the raw integer pointer
+    all_corners_wp = wp.array(ptr=ptr_coords, shape=(all_coords_cp.shape[0],), dtype=wp.vec3f, device='cuda', owner=False)
+    ptr_connectivity = all_connectivity_cp.data.ptr  # Get the raw integer pointer
+    all_connectivity_wp = wp.array(ptr=ptr_connectivity, shape=all_connectivity_cp.shape, dtype=wp.int32, device='cuda', owner=False)
+
     tolerance = voxSize / 1000
-    
     total_points = all_corners_wp.shape[0]
+
+    # Compute grid coordinates
     grid_coords = wp.zeros(total_points, dtype=wp.vec3i, device="cuda")
     wp.launch(kernel=compute_grid_coords, dim=total_points, inputs=[all_corners_wp, tolerance], outputs=[grid_coords])
-    
-    x_coords = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    y_coords = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    z_coords = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    
-    wp.launch(kernel=extract_component, dim=total_points, inputs=[grid_coords, 0, x_coords])
-    wp.launch(kernel=extract_component, dim=total_points, inputs=[grid_coords, 1, y_coords])
-    wp.launch(kernel=extract_component, dim=total_points, inputs=[grid_coords, 2, z_coords])
-    
-    min_x_result = wp.array([wp.int32(0x7FFFFFFF)], dtype=wp.int32, device="cuda")
-    min_y_result = wp.array([wp.int32(0x7FFFFFFF)], dtype=wp.int32, device="cuda")
-    min_z_result = wp.array([wp.int32(0x7FFFFFFF)], dtype=wp.int32, device="cuda")
-    
-    wp.launch(kernel=compute_min, dim=total_points, inputs=[x_coords, min_x_result])
-    wp.launch(kernel=compute_min, dim=total_points, inputs=[y_coords, min_y_result])
-    wp.launch(kernel=compute_min, dim=total_points, inputs=[z_coords, min_z_result])
-    
-    min_x = min_x_result.numpy()[0]
-    min_y = min_y_result.numpy()[0]
-    min_z = min_z_result.numpy()[0]
+
+    # Extract components using CuPy
+    grid_coords_cp = cp.asarray(grid_coords)
+    x_coords_cp = grid_coords_cp[:, 0]
+    y_coords_cp = grid_coords_cp[:, 1]
+    z_coords_cp = grid_coords_cp[:, 2]
+
+    # Compute min and max on GPU
+    min_x = cp.min(x_coords_cp).item()
+    min_y = cp.min(y_coords_cp).item()
+    min_z = cp.min(z_coords_cp).item()
+    max_x = cp.max(x_coords_cp).item()
+    max_y = cp.max(y_coords_cp).item()
+    max_z = cp.max(z_coords_cp).item()
+
+    # Normalize grid coordinates
     min_coords = wp.array([min_x, min_y, min_z], dtype=wp.int32, device="cuda")
     wp.launch(kernel=normalize_grid_coords, dim=total_points, inputs=[grid_coords, min_coords])
-    
-    max_x_result = wp.array([wp.int32(-0x80000000)], dtype=wp.int32, device="cuda")
-    max_y_result = wp.array([wp.int32(-0x80000000)], dtype=wp.int32, device="cuda")
-    max_z_result = wp.array([wp.int32(-0x80000000)], dtype=wp.int32, device="cuda")
-    
-    wp.launch(kernel=compute_max, dim=total_points, inputs=[x_coords, max_x_result])
-    wp.launch(kernel=compute_max, dim=total_points, inputs=[y_coords, max_y_result])
-    wp.launch(kernel=compute_max, dim=total_points, inputs=[z_coords, max_z_result])
-    
-    max_x = max_x_result.numpy()[0]
-    max_y = max_y_result.numpy()[0]
-    max_z = max_z_result.numpy()[0]
-    span = wp.array([max_x + 1, max_y + 1, max_z + 1], dtype=wp.int64, device="cuda")
-    span_np = span.numpy()
-    span_np[span_np == 0] = 1
-    span = wp.array(span_np, dtype=wp.int64, device="cuda")
+
+    # Compute spans
+    span = [max_x - min_x + 1, max_y - min_y + 1, max_z - min_z + 1]
+    span = [s if s > 0 else 1 for s in span]
+
+    # Compute linear indices
     indices = wp.zeros(total_points, dtype=wp.int64, device="cuda")
-    wp.launch(kernel=compute_indices, dim=total_points, inputs=[grid_coords, span], outputs=[indices])
-    
-    indices_np = indices.numpy()
-    sorted_order_np = np.argsort(indices_np)
-    sorted_order = wp.array(sorted_order_np, dtype=wp.int32, device="cuda")
-    sorted_indices_np = indices_np[sorted_order_np]
-    sorted_indices = wp.array(sorted_indices_np, dtype=wp.int64, device="cuda")
-    mask = wp.zeros(total_points, dtype=wp.uint8, device="cuda")
-    wp.launch(kernel=compute_mask, dim=total_points, inputs=[sorted_indices], outputs=[mask])
-    prefix_sum_np = np.cumsum(mask.numpy())
-    prefix_sum = wp.array(prefix_sum_np, dtype=wp.int32, device="cuda")
-    num_unique = prefix_sum_np[-1]
-    first_occurrence_indices = wp.zeros((num_unique,), dtype=wp.int32, device="cuda")
-    wp.launch(kernel=set_first_occurrence, dim=total_points, inputs=[mask, prefix_sum, sorted_order], outputs=[first_occurrence_indices])
-    all_corners_np = all_corners_wp.numpy()
-    unique_points_np = all_corners_np[first_occurrence_indices.numpy()]
-    unique_points_wp = wp.array(unique_points_np, dtype=wp.vec3f, device="cuda")
-    
-    unique_grid_indices_np = indices_np[first_occurrence_indices.numpy()]
-    unique_grid_indices = wp.array(unique_grid_indices_np, dtype=wp.int64, device="cuda")
-    mapping = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    wp.launch(kernel=compute_mapping, dim=total_points, inputs=[indices, unique_grid_indices], outputs=[mapping])
-    total_cells = all_connectivity_wp.shape[0]
-    new_cell_connectivity_wp = wp.zeros_like(all_connectivity_wp, device="cuda")
-    wp.launch(kernel=remap_connectivity, dim=total_cells, inputs=[all_connectivity_wp, mapping], outputs=[new_cell_connectivity_wp])
-    
-    unique_points = unique_points_wp.numpy()
-    new_cell_connectivity = new_cell_connectivity_wp.numpy()
-    
-    toccounter = time.perf_counter()
-    print(f"    Merged duplicate points in {toccounter - ticcounter:0.1f} seconds")
-    
+    wp.launch(kernel=compute_indices, dim=total_points, inputs=[grid_coords, wp.array(span, dtype=wp.int64, device="cuda")], outputs=[indices])
+
+    # Sort indices on GPU with CuPy
+    indices_cp = cp.asarray(indices)
+    sorted_order_cp = cp.argsort(indices_cp)
+    sorted_indices_cp = indices_cp[sorted_order_cp]
+
+    # Compute mask on GPU
+    mask_cp = cp.zeros_like(sorted_indices_cp, dtype=cp.uint8)
+    mask_cp[1:] = (sorted_indices_cp[1:] != sorted_indices_cp[:-1]).astype(cp.uint8)
+    mask_cp[0] = 1
+
+    # Compute prefix sum on GPU
+    prefix_sum_cp = cp.cumsum(mask_cp, dtype=cp.int32)
+    num_unique = prefix_sum_cp[-1].item()
+
+    # Get first occurrence indices
+    unique_indices_cp = cp.where(mask_cp)[0]
+    first_occurrence_indices_cp = sorted_order_cp[unique_indices_cp]
+
+    # Extract unique points
+    unique_points_cp = all_coords_cp[first_occurrence_indices_cp]
+
+    # Compute mapping with searchsorted
+    unique_grid_indices_cp = sorted_indices_cp[unique_indices_cp]
+    mapping_cp = cp.searchsorted(unique_grid_indices_cp, indices_cp, side='left')
+
+    # Remap connectivity
+    new_connectivity_cp = mapping_cp[all_connectivity_cp]
+
+    # Transfer final results to host
+    unique_points = unique_points_cp.get().astype(np.float32)
+    new_connectivity = new_connectivity_cp.get()
+
+    toc_counter = time.perf_counter()
+    print(f"    Merged duplicate points in {toc_counter - tic_counter:0.1f} seconds")
+
+    # Create connectivity array for VTK
     print("    Creating connectivity array")
     num_points_per_cell = np.full((total_cells, 1), 8, dtype=np.int64)
-    full_connectivity = np.hstack((num_points_per_cell, new_cell_connectivity)).flatten()
+    full_connectivity = np.hstack((num_points_per_cell, new_connectivity)).flatten()
     full_connectivity_vtk = numpy_to_vtkIdTypeArray(full_connectivity, deep=True)
     cell_types = np.full(total_cells, vtk.VTK_HEXAHEDRON, dtype=np.uint8)
     cell_types_vtk = numpy_to_vtk(cell_types, deep=True)
@@ -700,126 +615,133 @@ def save_to_unstructured_vtk(levels_data, filename, voxSize):
     level_data_array_vtk = numpy_to_vtk(np.array(all_levels, dtype=np.uint8), deep=True)
     level_data_array_vtk.SetName("Level")
     grid.GetCellData().AddArray(level_data_array_vtk)
+
+    # Write the VTK file
     print("    Writing Unstructured Grid VTU")
-    ticcounter = time.perf_counter()
+    tic_counter = time.perf_counter()
     writer = vtk.vtkXMLUnstructuredGridWriter()
     writer.SetFileName(filename)
     writer.SetDataModeToBinary()
     writer.SetInputData(grid)
     writer.Write()
-    toccounter = time.perf_counter()
+    toc_counter = time.perf_counter()
     toc = time.perf_counter()
-    print(f"    Combined Unstructured Grid VTU file written in {toccounter - ticcounter:0.1f} seconds")
+    print(f"    Combined Unstructured Grid VTU file written in {toc_counter - tic_counter:0.1f} seconds")
     print(f"    Total output processing complete {toc - tic:0.1f} seconds")
 
-# Save mesh data to an HDF5 file for XDMF visualization
+# Save mesh data to an HDF5 file for XDMF visualization with optimized merging
 def save_to_hdf5(levels_data, filename, voxSize):
     print("/// Creating combined HDF5 file for XDMF...")
     tic = time.perf_counter()
     num_voxels_per_level = [np.sum(data) for data, _, _, _ in levels_data]
     num_points_per_level = [8 * num_voxels for num_voxels in num_voxels_per_level]
     point_id_offsets = np.cumsum([0] + num_points_per_level[:-1])
-    all_corners = []
-    all_cell_connectivity = []
+    all_corners_wp = []
+    all_connectivity_wp = []
     all_levels = []
     total_cells = 0
     for level_idx, (data, v, origin, level) in enumerate(levels_data):
-        corners, cell_connectivity, _ = process_level_gpu((data, v, origin, level, point_id_offsets[level_idx]))
+        corners_wp, connectivity_wp, _ = process_level_gpu((data, v, origin, level, point_id_offsets[level_idx]))
         if num_voxels_per_level[level_idx] > 0:
             print(f"    Processing level {level}: Voxel size {v}, Origin {origin}, Shape {data.shape}")
         else:
             print(f"    Skipping level {level} (no unique data)")
-        all_corners.append(corners)
-        all_cell_connectivity.append(cell_connectivity)
-        all_levels.extend([level] * cell_connectivity.shape[0])
-        total_cells += cell_connectivity.shape[0]
+        all_corners_wp.append(corners_wp)
+        all_connectivity_wp.append(connectivity_wp)
+        all_levels.extend([level] * connectivity_wp.shape[0])
+        total_cells += connectivity_wp.shape[0]
     print("    Processing levels complete")
-    all_coords = np.vstack(all_corners)
-    point_ids = np.vstack(all_cell_connectivity)
+
+    # Stack coordinates and connectivity on GPU
+    all_coords_cp = cp.concatenate([cp.asarray(c) for c in all_corners_wp], axis=0)
+    all_connectivity_cp = cp.concatenate([cp.asarray(c) for c in all_connectivity_wp], axis=0)
+
+    # Optimized merging of duplicate points on GPU
     print("    Merging duplicate points")
     tic_counter = time.perf_counter()
-    
-    all_corners_wp = wp.array(all_coords, dtype=wp.vec3f, device="cuda")
-    all_connectivity_wp = wp.array(point_ids, dtype=wp.int32, device="cuda")
+
+    # Create Warp arrays from CuPy arrays using pointers
+    ptr_coords = all_coords_cp.data.ptr  # Get the raw integer pointer
+    all_corners_wp = wp.array(ptr=ptr_coords, shape=(all_coords_cp.shape[0],), dtype=wp.vec3f, device='cuda', owner=False)
+    ptr_connectivity = all_connectivity_cp.data.ptr  # Get the raw integer pointer
+    num_elements_connectivity = all_connectivity_cp.size
+    all_connectivity_wp = wp.array(ptr=ptr_connectivity, shape=all_connectivity_cp.shape, dtype=wp.int32, device='cuda', owner=False)
+
     tolerance = voxSize / 1000
-    
     total_points = all_corners_wp.shape[0]
+
+    # Compute grid coordinates
     grid_coords = wp.zeros(total_points, dtype=wp.vec3i, device="cuda")
     wp.launch(kernel=compute_grid_coords, dim=total_points, inputs=[all_corners_wp, tolerance], outputs=[grid_coords])
-    
-    x_coords = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    y_coords = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    z_coords = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    
-    wp.launch(kernel=extract_component, dim=total_points, inputs=[grid_coords, 0, x_coords])
-    wp.launch(kernel=extract_component, dim=total_points, inputs=[grid_coords, 1, y_coords])
-    wp.launch(kernel=extract_component, dim=total_points, inputs=[grid_coords, 2, z_coords])
-    
-    min_x_result = wp.array([wp.int32(0x7FFFFFFF)], dtype=wp.int32, device="cuda")
-    min_y_result = wp.array([wp.int32(0x7FFFFFFF)], dtype=wp.int32, device="cuda")
-    min_z_result = wp.array([wp.int32(0x7FFFFFFF)], dtype=wp.int32, device="cuda")
-    
-    wp.launch(kernel=compute_min, dim=total_points, inputs=[x_coords, min_x_result])
-    wp.launch(kernel=compute_min, dim=total_points, inputs=[y_coords, min_y_result])
-    wp.launch(kernel=compute_min, dim=total_points, inputs=[z_coords, min_z_result])
-    
-    min_x = min_x_result.numpy()[0]
-    min_y = min_y_result.numpy()[0]
-    min_z = min_z_result.numpy()[0]
+
+    # Extract components using CuPy
+    grid_coords_cp = cp.asarray(grid_coords)
+    x_coords_cp = grid_coords_cp[:, 0]
+    y_coords_cp = grid_coords_cp[:, 1]
+    z_coords_cp = grid_coords_cp[:, 2]
+
+    # Compute min and max on GPU
+    min_x = cp.min(x_coords_cp).item()
+    min_y = cp.min(y_coords_cp).item()
+    min_z = cp.min(z_coords_cp).item()
+    max_x = cp.max(x_coords_cp).item()
+    max_y = cp.max(y_coords_cp).item()
+    max_z = cp.max(z_coords_cp).item()
+
+    # Normalize grid coordinates
     min_coords = wp.array([min_x, min_y, min_z], dtype=wp.int32, device="cuda")
     wp.launch(kernel=normalize_grid_coords, dim=total_points, inputs=[grid_coords, min_coords])
-    
-    max_x_result = wp.array([wp.int32(-0x80000000)], dtype=wp.int32, device="cuda")
-    max_y_result = wp.array([wp.int32(-0x80000000)], dtype=wp.int32, device="cuda")
-    max_z_result = wp.array([wp.int32(-0x80000000)], dtype=wp.int32, device="cuda")
-    
-    wp.launch(kernel=compute_max, dim=total_points, inputs=[x_coords, max_x_result])
-    wp.launch(kernel=compute_max, dim=total_points, inputs=[y_coords, max_y_result])
-    wp.launch(kernel=compute_max, dim=total_points, inputs=[z_coords, max_z_result])
-    
-    max_x = max_x_result.numpy()[0]
-    max_y = max_y_result.numpy()[0]
-    max_z = max_z_result.numpy()[0]
-    span = wp.array([max_x + 1, max_y + 1, max_z + 1], dtype=wp.int64, device="cuda")
-    span_np = span.numpy()
-    span_np[span_np == 0] = 1
-    span = wp.array(span_np, dtype=wp.int64, device="cuda")
+
+    # Compute spans
+    span = [max_x - min_x + 1, max_y - min_y + 1, max_z - min_z + 1]
+    span = [s if s > 0 else 1 for s in span]
+
+    # Compute linear indices
     indices = wp.zeros(total_points, dtype=wp.int64, device="cuda")
-    wp.launch(kernel=compute_indices, dim=total_points, inputs=[grid_coords, span], outputs=[indices])
-    
-    indices_np = indices.numpy()
-    sorted_order_np = np.argsort(indices_np)
-    sorted_order = wp.array(sorted_order_np, dtype=wp.int32, device="cuda")
-    sorted_indices_np = indices_np[sorted_order_np]
-    sorted_indices = wp.array(sorted_indices_np, dtype=wp.int64, device="cuda")
-    mask = wp.zeros(total_points, dtype=wp.uint8, device="cuda")
-    wp.launch(kernel=compute_mask, dim=total_points, inputs=[sorted_indices], outputs=[mask])
-    prefix_sum_np = np.cumsum(mask.numpy())
-    prefix_sum = wp.array(prefix_sum_np, dtype=wp.int32, device="cuda")
-    num_unique = prefix_sum_np[-1]
-    first_occurrence_indices = wp.zeros((num_unique,), dtype=wp.int32, device="cuda")
-    wp.launch(kernel=set_first_occurrence, dim=total_points, inputs=[mask, prefix_sum, sorted_order], outputs=[first_occurrence_indices])
-    all_corners_np = all_corners_wp.numpy()
-    unique_points = all_corners_np[first_occurrence_indices.numpy()].astype(np.float32)
-    
-    unique_grid_indices_np = indices_np[first_occurrence_indices.numpy()]
-    unique_grid_indices = wp.array(unique_grid_indices_np, dtype=wp.int64, device="cuda")
-    mapping = wp.zeros(total_points, dtype=wp.int32, device="cuda")
-    wp.launch(kernel=compute_mapping, dim=total_points, inputs=[indices, unique_grid_indices], outputs=[mapping])
-    total_cells = all_connectivity_wp.shape[0]
-    new_cell_connectivity_wp = wp.zeros_like(all_connectivity_wp, device="cuda")
-    wp.launch(kernel=remap_connectivity, dim=total_cells, inputs=[all_connectivity_wp, mapping], outputs=[new_cell_connectivity_wp])
-    connectivity = new_cell_connectivity_wp.numpy()
-    
+    wp.launch(kernel=compute_indices, dim=total_points, inputs=[grid_coords, wp.array(span, dtype=wp.int64, device="cuda")], outputs=[indices])
+
+    # Sort indices on GPU with CuPy
+    indices_cp = cp.asarray(indices)
+    sorted_order_cp = cp.argsort(indices_cp)
+    sorted_indices_cp = indices_cp[sorted_order_cp]
+
+    # Compute mask on GPU
+    mask_cp = cp.zeros_like(sorted_indices_cp, dtype=cp.uint8)
+    mask_cp[1:] = (sorted_indices_cp[1:] != sorted_indices_cp[:-1]).astype(cp.uint8)
+    mask_cp[0] = 1
+
+    # Compute prefix sum on GPU
+    prefix_sum_cp = cp.cumsum(mask_cp, dtype=cp.int32)
+    num_unique = prefix_sum_cp[-1].item()
+
+    # Get first occurrence indices
+    unique_indices_cp = cp.where(mask_cp)[0]
+    first_occurrence_indices_cp = sorted_order_cp[unique_indices_cp]
+
+    # Extract unique points
+    unique_points_cp = all_coords_cp[first_occurrence_indices_cp]
+
+    # Compute mapping with searchsorted
+    unique_grid_indices_cp = sorted_indices_cp[unique_indices_cp]
+    mapping_cp = cp.searchsorted(unique_grid_indices_cp, indices_cp, side='left')
+
+    # Remap connectivity
+    new_connectivity_cp = mapping_cp[all_connectivity_cp]
+
+    # Transfer final results to host
+    unique_points = unique_points_cp.get().astype(np.float32)
+    connectivity = new_connectivity_cp.get()
+
     toc_counter = time.perf_counter()
     print(f"    Merged duplicate points in {toc_counter - tic_counter:0.1f} seconds")
-    
+
+    # Write HDF5 file
     print("    Writing HDF5 file")
     tic_counter = time.perf_counter()
     with h5py.File(filename, 'w') as f:
-        f.create_dataset('/Mesh/Points', data=unique_points, compression='gzip', compression_opts=0)
-        f.create_dataset('/Mesh/Connectivity', data=connectivity, compression='gzip', compression_opts=0)
-        f.create_dataset('/Mesh/Level', data=np.array(all_levels, dtype=np.uint8), compression='gzip', compression_opts=0)
+        f.create_dataset('/Mesh/Points', data=unique_points, compression='gzip', compression_opts=2)
+        f.create_dataset('/Mesh/Connectivity', data=connectivity, compression='gzip', compression_opts=2)
+        f.create_dataset('/Mesh/Level', data=np.array(all_levels, dtype=np.uint8), compression='gzip', compression_opts=2)
         f.attrs['voxel_size'] = voxSize
         f.attrs['total_cells'] = total_cells
         f.attrs['point_count'] = len(unique_points)
@@ -961,8 +883,8 @@ def makeMesh(levels, filename, voxSize, kernel, domainMin, domainMax, close=True
     f, origin = fill_gpu(g, voxSize, origin, close)
     df, origin = crop_gpu(f, origin, domainMin, domainMax, v)
     dOrigin = np.copy(origin)
-    dr = df.copy()
-    level_data.append((df.copy(), dr.copy(), v, dOrigin.copy()))
+    dr = df.copy()  # dr is the final matrix for this level
+    level_data.append((dr, v, dOrigin, 0))  # Store only dr
     tocLevel = time.perf_counter()
     print(f"    Level defined in {tocLevel - ticLevel:0.1f} seconds")
     
@@ -1006,8 +928,7 @@ def makeMesh(levels, filename, voxSize, kernel, domainMin, domainMax, close=True
             df = df_natural
 
         dr = remove_gpu(df, dOrigin, d, origin, v)
-
-        level_data.append((df.copy(), dr.copy(), v, dOrigin.copy()))
+        level_data.append((dr, v, dOrigin, l))  # Store only dr
         tocLevel = time.perf_counter()
         print(f"    Level defined in {tocLevel - ticLevel:0.1f} seconds")
         origin = np.copy(dOrigin)
@@ -1020,7 +941,7 @@ def makeMesh(levels, filename, voxSize, kernel, domainMin, domainMax, close=True
     total_voxels_billions = finest_possible_voxels / 1e9
     print(f"    Total domain size: {total_voxels_billions:.2f} billion voxels (if filled at finest resolution {voxSize} m)")
 
-    total_voxel_count = sum(np.sum(dr) for _, dr, _, _ in level_data)
+    total_voxel_count = sum(np.sum(dr) for dr, _, _, _ in level_data)
     total_voxel_count_millions = total_voxel_count / 1e6
     print(f"    Total voxel count: {total_voxel_count_millions:.2f} million")
 
@@ -1030,7 +951,7 @@ def makeMesh(levels, filename, voxSize, kernel, domainMin, domainMax, close=True
     print("    Voxel distribution per level:")
     headers = ["Level", "Voxel Size (m)", "Voxels (M)", "Percentage (%)"]
     table_data = []
-    for l, (df, dr, v, dOrigin) in enumerate(level_data):
+    for l, (dr, v, _, _) in enumerate(level_data):
         voxel_count = np.sum(dr)
         voxel_count_millions = voxel_count / 1e6
         percentage = (voxel_count / total_voxel_count) * 100 if total_voxel_count > 0 else 0
@@ -1040,13 +961,13 @@ def makeMesh(levels, filename, voxSize, kernel, domainMin, domainMax, close=True
 
     # File output
     ### VTU Output ###
-    # save_to_unstructured_vtk(
-        # [(dr, v, dOrigin, l) for l, (df, dr, v, dOrigin) in enumerate(level_data)],
-        # stem + "_Unstructured_WARP.vtu", voxSize)
+    save_to_unstructured_vtk(
+        [(dr, v, dOrigin, l) for dr, v, dOrigin, l in level_data],
+        stem + "_Unstructured_WARP.vtu", voxSize)
 
-    # ### HDF5 Output ###
+    ### HDF5 Output ###
     total_cells, num_points = save_to_hdf5(
-        [(dr, v, dOrigin, l) for l, (df, dr, v, dOrigin) in enumerate(level_data)],
+        [(dr, v, dOrigin, l) for dr, v, dOrigin, l in level_data],
         stem + "_Unstructured_WARP.h5", voxSize)
     save_xdmf(stem + "_Unstructured_WARP.h5", stem + "_Unstructured_WARP.xmf", total_cells, num_points)
 
@@ -1079,13 +1000,14 @@ def calculate_kernel(padding_values):
 # Values to be used for Studio Wind Tunnel
 padding_values = {
     0: (2, 2, 2, 2, 2, 2),
-    1: (4, 8, 4, 4, 4, 4),
-    2: (8, 80, 8, 8, 8, 8),
-    3: (8, 80, 8, 8, 8, 8),
-    4: (4, 80, 4, 4, 4, 4),
+    1: (4, 4, 4, 4, 4, 4),
+    2: (4, 40, 8, 8, 8, 8),
+    3: (4, 40, 8, 8, 8, 8),
+    4: (4, 40, 4, 4, 4, 4),
     5: (4, 40, 4, 4, 4, 4),
     6: (4, 4, 4, 4, 4, 4),
     7: (4, 4, 4, 4, 4, 4),
+    8: (4, 4, 4, 4, 4, 4),
 }
 
 # Values to be used for Lid Driven Cavity
@@ -1100,17 +1022,11 @@ padding_values = {
     # 7: (4, 4, 4, 4, 4, 4),
 # }
 
-
 kernel = calculate_kernel(padding_values)
 
 # Execute the meshing process
-
-makeMesh(7, "suv.stl", 0.003, kernel, np.array([-5,-10,0],float), np.array([15,10,10],float), True, ground_refinement_level=3)
-
-#makeMesh(7,"Ahmed_25.stl",0.005,kernel,np.array([0,-5,0],float),np.array([10,5,5],float),True,ground_refinement_level=3)
+makeMesh(8, "Ahmed_25.stl", 0.001, kernel, np.array([0, -5, 0], float), np.array([10, 5, 5], float), True, ground_refinement_level=4)
 
 #makeMesh(7,"UnitCube.stl",0.00195694716242661448140900195695,kernel,np.array([0,0,0],float),np.array([1,1,1],float),True)
 
-#makeMesh(7,"WilliamsF1down.stl",0.003,kernel,np.array([-5,-10,0],float),np.array([20,10,10],float),True)
-
-#makeMesh(7,"S550_GT500_BS_Combined.stl",0.02,kernel,np.array([-10,-10,0],float),np.array([25,10,10],float),close)
+#makeMesh(7,"S550_GT500_BS_Combined.stl",0.003,kernel,np.array([-10,-10,0],float),np.array([25,10,10],float),True)
